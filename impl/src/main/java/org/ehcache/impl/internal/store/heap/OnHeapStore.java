@@ -17,7 +17,6 @@
 package org.ehcache.impl.internal.store.heap;
 
 import org.ehcache.Cache;
-import org.ehcache.ValueSupplier;
 import org.ehcache.core.CacheConfigurationChangeEvent;
 import org.ehcache.core.CacheConfigurationChangeListener;
 import org.ehcache.core.CacheConfigurationProperty;
@@ -82,7 +81,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.NoSuchElementException;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -144,15 +142,13 @@ public class OnHeapStore<K, V> implements Store<K,V>, HigherCachingTier<K, V> {
   };
 
   static final int SAMPLE_SIZE = 8;
+  private volatile Backend<K, V> map;
 
-  private final Backend<K, V> map;
   private final Class<K> keyType;
   private final Class<V> valueType;
   private final Copier<V> valueCopier;
 
   private final SizeOfEngine sizeOfEngine;
-  private final boolean byteSized;
-  private final AtomicLong currentUsageinBytes = new AtomicLong(0L);
 
   private volatile long capacity;
   private final EvictionVeto<? super K, ? super V> evictionVeto;
@@ -218,7 +214,7 @@ public class OnHeapStore<K, V> implements Store<K,V>, HigherCachingTier<K, V> {
       throw new IllegalArgumentException("OnHeap store must be configured with a resource of type 'heap'");
     }
     this.sizeOfEngine = sizeOfEngine;
-    this.byteSized = this.sizeOfEngine instanceof NoopSizeOfEngine ? false : true;
+    boolean byteSized = this.sizeOfEngine instanceof NoopSizeOfEngine ? false : true;
     this.capacity = byteSized ? ((MemoryUnit) heapPool.getUnit()).toBytes(heapPool.getSize()) : heapPool.getSize();
     this.timeSource = timeSource;
     if (config.getEvictionVeto() == null) {
@@ -232,9 +228,9 @@ public class OnHeapStore<K, V> implements Store<K,V>, HigherCachingTier<K, V> {
     this.valueCopier = valueCopier;
     this.storeEventDispatcher = eventDispatcher;
     if (keyCopier instanceof IdentityCopier) {
-      this.map = new SimpleBackend<K, V>();
+      this.map = new SimpleBackend<K, V>(byteSized);
     } else {
-      this.map = new KeyCopyBackend<K, V>(keyCopier);
+      this.map = new KeyCopyBackend<K, V>(byteSized, keyCopier);
     }
     onHeapStoreStatsSettings = new OnHeapStoreStatsSettings(this);
     StatisticsManager.associate(onHeapStoreStatsSettings).withParent(this);
@@ -643,18 +639,8 @@ public class OnHeapStore<K, V> implements Store<K,V>, HigherCachingTier<K, V> {
   }
 
   @Override
-  public void clear() throws StoreAccessException {
-    try {
-      //TODO: Not thread safe, can we do better ?
-      long current = currentUsageinBytes.get();
-      map.clear();
-      current = currentUsageinBytes.addAndGet(-current);
-      if(current < 0L) {
-        currentUsageinBytes.addAndGet(current);
-      }
-    } catch (RuntimeException re) {
-      handleRuntimeException(re);
-    }
+  public void clear() {
+    this.map = map.clear();
   }
 
   private void invalidate() {
@@ -670,66 +656,28 @@ public class OnHeapStore<K, V> implements Store<K,V>, HigherCachingTier<K, V> {
 
   @Override
   public Iterator<Cache.Entry<K, ValueHolder<V>>> iterator() {
-    final java.util.Iterator<Map.Entry<K, OnHeapValueHolder<V>>> it = map.entrySetIterator();
     return new Iterator<Cache.Entry<K, ValueHolder<V>>>() {
-      private Map.Entry<K, OnHeapValueHolder<V>> next = null;
-      private StoreAccessException prefetchFailure = null;
-
-      {
-        advance();
-      }
-
-      private void advance() {
-        next = null;
-        try {
-          while (next == null && it.hasNext()) {
-            Map.Entry<K, OnHeapValueHolder<V>> entry = it.next();
-            final long now = timeSource.getTimeMillis();
-            if (entry.getValue().isExpired(now, TimeUnit.MILLISECONDS)) {
-              internalGet(entry.getKey(), false);
-              continue;
-            }
-
-            next = entry;
-          }
-        } catch (RuntimeException re) {
-          prefetchFailure = new StoreAccessException(re);
-        } catch (StoreAccessException e) {
-          prefetchFailure = e;
-        }
-      }
+      private final java.util.Iterator<Map.Entry<K, OnHeapValueHolder<V>>> it = map.entrySetIterator();
 
       @Override
       public boolean hasNext() {
-        return next != null || prefetchFailure != null;
+        return it.hasNext();
       }
 
       @Override
       public Cache.Entry<K, ValueHolder<V>> next() throws StoreAccessException {
-        if(prefetchFailure != null) {
-          throw prefetchFailure;
-        }
-
-        if (next == null) {
-          throw new NoSuchElementException();
-        }
-
-        final Map.Entry<K, OnHeapValueHolder<V>> thisEntry = next;
-        advance();
-
-        setAccessTimeAndExpiryThenReturnMappingOutsideLock(thisEntry.getKey(), thisEntry.getValue(), timeSource.getTimeMillis());
-
+        Entry<K, OnHeapValueHolder<V>> next = it.next();
+        final K key = next.getKey();
+        final OnHeapValueHolder<V> value = next.getValue();
         return new Cache.Entry<K, ValueHolder<V>>() {
           @Override
           public K getKey() {
-            return thisEntry.getKey();
+            return key;
           }
-
           @Override
           public ValueHolder<V> getValue() {
-            return thisEntry.getValue();
+            return value;
           }
-
         };
       }
     };
@@ -1498,27 +1446,11 @@ public class OnHeapStore<K, V> implements Store<K,V>, HigherCachingTier<K, V> {
   }
 
   private void updateUsageInBytesIfRequired(long delta) {
-    if (byteSized) {
-      long currentSize = currentUsageinBytes.addAndGet(delta);
-      if(currentSize < 0L) {
-        throw new AssertionError("Current usage can never be negative - " + currentSize);
-      }
-    }
+    map.updateUsageInBytesIfRequired(delta);
   }
 
-  protected long getCurrentUsageInBytes() {
-    if (byteSized) {
-      return currentUsageinBytes.get();
-    }
-    return 0L;
-  }
-
-  private long size() {
-    if (byteSized) {
-      return currentUsageinBytes.get();
-    } else {
-      return map.size();
-    }
+  protected long byteSized() {
+    return map.byteSize();
   }
 
   @FindbugsSuppressWarnings("QF_QUESTIONABLE_FOR_LOOP")
@@ -1526,7 +1458,7 @@ public class OnHeapStore<K, V> implements Store<K,V>, HigherCachingTier<K, V> {
     StoreEventSink<K, V> eventSink = storeEventDispatcher.eventSink();
     try {
       for (int attempts = 0, evicted = 0; attempts < ATTEMPT_RATIO && evicted < EVICTION_RATIO
-              && capacity < size(); attempts++) {
+              && capacity < map.naturalSize(); attempts++) {
         if (evict(eventSink)) {
           evicted++;
         }
@@ -1654,7 +1586,7 @@ public class OnHeapStore<K, V> implements Store<K,V>, HigherCachingTier<K, V> {
     }
 
     static void close(final OnHeapStore onHeapStore) {
-      onHeapStore.map.clear();
+      onHeapStore.clear();
     }
 
     @Override
